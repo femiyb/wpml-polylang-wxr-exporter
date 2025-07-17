@@ -11,17 +11,18 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Load basic plugin functionality for both single-site and multisite
+add_action('plugins_loaded', function () {
+    Language_Exporter::init();
+});
+
+// Load MLP settings tab ONLY in multisite, and at the correct timing
 add_action('muplugins_loaded', function () {
-    if (!class_exists('Inpsyde\\MultilingualPress\\Core\\ServiceProvider')) {
-        error_log('MLP ServiceProvider not found');
-        return;
-    }
-
-    // Add this line that's missing:  
-    Language_Exporter::init(); 
-   
-
-    if (is_network_admin()) {
+    if (
+        is_multisite() &&
+        is_network_admin() &&
+        class_exists('Inpsyde\\MultilingualPress\\Core\\ServiceProvider')
+    ) {
         add_filter(
             \Inpsyde\MultilingualPress\Core\ServiceProvider::ACTION_BUILD_TABS,
             ['Language_Exporter', 'add_mlp_settings_tabs']
@@ -29,17 +30,19 @@ add_action('muplugins_loaded', function () {
     }
 });
 
-
-
-
 class Language_Exporter {
+
     public static function init() {
+        add_action('admin_menu', [__CLASS__, 'add_language_export_page']);
         add_action('admin_init', [__CLASS__, 'handle_wpml_export']);
-        add_action(
-            \Inpsyde\MultilingualPress\Core\Admin\PluginSettingsUpdater::ACTION_UPDATE_PLUGIN_SETTINGS,
-            [__CLASS__, 'handle_site_relations']
-        );
-            }
+
+        if (class_exists('Inpsyde\\MultilingualPress\\Core\\Admin\\PluginSettingsUpdater')) {
+            add_action(
+                \Inpsyde\MultilingualPress\Core\Admin\PluginSettingsUpdater::ACTION_UPDATE_PLUGIN_SETTINGS,
+                [__CLASS__, 'handle_site_relations']
+            );
+        }
+    }
 
     public static function get_active_plugin() {
         if (function_exists('icl_get_languages')) return 'WPML';
@@ -47,24 +50,36 @@ class Language_Exporter {
         return 'None';
     }
 
-    public static function render_content_export_tab() {
-        $plugin = self::get_active_plugin();
-        echo '<div class="wrap"><h2>Content Export</h2>';
-        echo '<p><strong>Detected Plugin:</strong> ' . esc_html($plugin) . '</p>';
+    public static function add_language_export_page() {
+        add_management_page(
+            __('Language Export', 'language-exporter'),
+            __('Language Export', 'language-exporter'),
+            'manage_options',
+            'language-export',
+            [__CLASS__, 'render_standalone_export_page']
+        );
+    }
 
-        if ($plugin === 'WPML') {
+    public static function render_standalone_export_page() {
+        echo '<div class="wrap">';
+        echo '<h1>' . esc_html__('Language Export', 'language-exporter') . '</h1>';
+        echo '<p><strong>' . esc_html__('Detected Plugin:', 'language-exporter') . '</strong> ' . esc_html(self::get_active_plugin()) . '</p>';
+
+        if (self::get_active_plugin() === 'WPML') {
             self::render_wpml_form();
-        } elseif ($plugin === 'Polylang') {
+        } elseif (self::get_active_plugin() === 'Polylang') {
             self::render_polylang_form();
         } else {
-            echo '<div class="notice notice-error"><p>No multilingual plugin detected.</p></div>';
+            echo '<div class="notice notice-error"><p>No supported multilingual plugin found.</p></div>';
         }
+
         echo '</div>';
     }
 
     public static function render_wpml_form() {
-        $lang = apply_filters('wpml_current_language', NULL);
+        $lang = apply_filters('wpml_current_language', null);
         $woo = class_exists('WooCommerce');
+
         echo '<form method="POST">';
         wp_nonce_field('wpml_export_nonce', 'wpml_export_nonce');
         echo '<input type="hidden" name="export_language" value="' . esc_attr($lang) . '">';
@@ -80,7 +95,7 @@ class Language_Exporter {
         if (!isset($_POST['wpml_export_submit'])) return;
         if (!wp_verify_nonce($_POST['wpml_export_nonce'], 'wpml_export_nonce')) wp_die("Security check failed");
 
-        $lang = apply_filters('wpml_current_language', NULL);
+        $lang = apply_filters('wpml_current_language', null);
         $types = isset($_POST['export_types']) ? array_map('sanitize_text_field', $_POST['export_types']) : [];
 
         global $wpdb;
@@ -114,9 +129,11 @@ class Language_Exporter {
     }
 
     public static function render_polylang_form() {
+        if (!function_exists('pll_get_languages')) return;
+
         $langs = pll_get_languages(['fields' => 'slug']);
         echo '<form method="GET">';
-        echo '<input type="hidden" name="page" value="language-exporter">';
+        echo '<input type="hidden" name="page" value="language-export">';
         echo '<select name="lang">';
         foreach ($langs as $slug) {
             echo '<option value="' . esc_attr($slug) . '">' . esc_html(strtoupper($slug)) . '</option>';
@@ -146,10 +163,26 @@ class Language_Exporter {
         exit;
     }
 
+    public static function add_mlp_settings_tabs(array $tabs): array {
+        $tabs['site-relations-export'] = new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTab(
+            new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTabData(
+                'site-relations-export',
+                __('Site Relations', 'language-exporter'),
+                'site-relations-export'
+            ),
+            new class implements \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageView {
+                public function render(): void {
+                    Language_Exporter::render_site_relations_tab();
+                }
+            }
+        );
+
+        return $tabs;
+    }
+
     public static function render_site_relations_tab() {
         echo '<div class="wrap"><h2>Site Relations Export / Import</h2>';
-    
-        // ✅ Display import results from transient
+
         if ($results = get_transient('mlp_import_results')) {
             delete_transient('mlp_import_results');
             foreach ($results['success'] as $msg) {
@@ -159,25 +192,18 @@ class Language_Exporter {
                 echo '<div class="notice notice-error"><p>' . esc_html($err) . '</p></div>';
             }
         }
-    
-        // ✅ This button submits through MLP's main form
+
         echo '<p><input type="submit" name="export_site_relations" class="button" value="Download Site Relations JSON"></p>';
-    
         echo '<h3>Import Site Relations</h3>';
         echo '<p><label for="import_json">Paste JSON content:</label></p>';
         echo '<textarea name="import_json" rows="10" cols="80" placeholder="Paste your exported JSON here..."></textarea>';
         echo '<input type="hidden" name="import_site_relations_json" value="1">';
-    
         echo '</div>';
     }
-    
 
     public static function handle_site_relations() {
         if (!current_user_can('manage_options')) return;
-    
-        // ✅ No nonce needed — MLP already verifies the form
-    
-        // ✅ Handle Export
+
         if (isset($_POST['export_site_relations'])) {
             $data = self::export_site_relations();
             header('Content-Type: application/json');
@@ -185,12 +211,11 @@ class Language_Exporter {
             echo json_encode($data, JSON_PRETTY_PRINT);
             exit;
         }
-    
-        // ✅ Handle Import
+
         if (isset($_POST['import_site_relations_json']) && !empty($_POST['import_json'])) {
             $json = stripslashes_deep($_POST['import_json']);
             $data = json_decode($json, true);
-    
+
             if ($data === null) {
                 set_transient('mlp_import_results', [
                     'success' => [],
@@ -202,8 +227,6 @@ class Language_Exporter {
             }
         }
     }
-    
-    
 
     public static function export_site_relations() {
         $siteRelations = \Inpsyde\MultilingualPress\resolve(\Inpsyde\MultilingualPress\Framework\Api\SiteRelations::class);
@@ -236,7 +259,7 @@ class Language_Exporter {
             return $results;
         }
         foreach ($data['relations'] as $siteId => $rel) {
-            $siteId = (int) $siteId;
+            $siteId = (int)$siteId;
             if (!get_site($siteId)) {
                 $results['errors'][] = "Site {$siteId} does not exist";
                 continue;
@@ -257,35 +280,5 @@ class Language_Exporter {
             }
         }
         return $results;
-    }
-
-    public static function add_mlp_settings_tabs(array $tabs): array {
-        $tabs['language-content-export'] = new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTab(
-            new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTabData(
-                'language-content-export',
-                __('Language Content Export', 'language-exporter'),
-                'language-content-export'
-            ),
-            new class implements \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageView {
-                public function render(): void {
-                    Language_Exporter::render_content_export_tab();
-                }
-            }
-        );
-
-        $tabs['site-relations-export'] = new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTab(
-            new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTabData(
-                'site-relations-export',
-                __('Site Relations', 'language-exporter'),
-                'site-relations-export'
-            ),
-            new class implements \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageView {
-                public function render(): void {
-                    Language_Exporter::render_site_relations_tab();
-                }
-            }
-        );
-
-        return $tabs;
     }
 }
