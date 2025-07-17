@@ -11,43 +11,45 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-// Load main class
-require_once plugin_dir_path(__FILE__) . 'includes/class-language-exporter.php';
+add_action('muplugins_loaded', function () {
+    if (!class_exists('Inpsyde\\MultilingualPress\\Core\\ServiceProvider')) {
+        error_log('MLP ServiceProvider not found');
+        return;
+    }
 
-add_action('plugins_loaded', ['Language_Exporter', 'init']);
+    // Add this line that's missing:  
+    Language_Exporter::init(); 
+   
+
+    if (is_network_admin()) {
+        add_filter(
+            \Inpsyde\MultilingualPress\Core\ServiceProvider::ACTION_BUILD_TABS,
+            ['Language_Exporter', 'add_mlp_settings_tabs']
+        );
+    }
+});
+
+
+
 
 class Language_Exporter {
     public static function init() {
-        add_action('admin_menu', [__CLASS__, 'add_admin_page']);
         add_action('admin_init', [__CLASS__, 'handle_wpml_export']);
-        add_action('admin_init', [__CLASS__, 'handle_site_relations']);
-    }
-
-    public static function add_admin_page() {
-        add_management_page(
-            'Language Exporter', 'Language Exporter', 'manage_options', 'language-exporter', [__CLASS__, 'render_page']
+        add_action(
+            \Inpsyde\MultilingualPress\Core\Admin\PluginSettingsUpdater::ACTION_UPDATE_PLUGIN_SETTINGS,
+            [__CLASS__, 'handle_site_relations']
         );
-    }
+            }
 
-    public static function render_page() {
-        $tab = $_GET['tab'] ?? 'content';
-        echo '<div class="wrap"><h1>Language Exporter</h1>';
-        echo '<nav class="nav-tab-wrapper">';
-        echo '<a href="?page=language-exporter&tab=content" class="nav-tab ' . ($tab === 'content' ? 'nav-tab-active' : '') . '">Content Export</a>';
-        echo '<a href="?page=language-exporter&tab=relations" class="nav-tab ' . ($tab === 'relations' ? 'nav-tab-active' : '') . '">Site Relations</a>';
-        echo '</nav>';
-
-        if ($tab === 'content') {
-            self::render_content_export_tab();
-        } else {
-            self::render_site_relations_tab();
-        }
-
-        echo '</div>';
+    public static function get_active_plugin() {
+        if (function_exists('icl_get_languages')) return 'WPML';
+        if (function_exists('pll_get_languages')) return 'Polylang';
+        return 'None';
     }
 
     public static function render_content_export_tab() {
         $plugin = self::get_active_plugin();
+        echo '<div class="wrap"><h2>Content Export</h2>';
         echo '<p><strong>Detected Plugin:</strong> ' . esc_html($plugin) . '</p>';
 
         if ($plugin === 'WPML') {
@@ -57,12 +59,7 @@ class Language_Exporter {
         } else {
             echo '<div class="notice notice-error"><p>No multilingual plugin detected.</p></div>';
         }
-    }
-
-    public static function get_active_plugin() {
-        if (function_exists('icl_get_languages')) return 'WPML';
-        if (function_exists('pll_get_languages')) return 'Polylang';
-        return 'None';
+        echo '</div>';
     }
 
     public static function render_wpml_form() {
@@ -150,43 +147,66 @@ class Language_Exporter {
     }
 
     public static function render_site_relations_tab() {
-        echo '<form method="post" enctype="multipart/form-data">';
-        wp_nonce_field('site_relations_action', 'site_relations_nonce');
+        echo '<div class="wrap"><h2>Site Relations Export / Import</h2>';
+    
+        // ✅ Display import results from transient
+        if ($results = get_transient('mlp_import_results')) {
+            delete_transient('mlp_import_results');
+            foreach ($results['success'] as $msg) {
+                echo '<div class="notice notice-success"><p>' . esc_html($msg) . '</p></div>';
+            }
+            foreach ($results['errors'] as $err) {
+                echo '<div class="notice notice-error"><p>' . esc_html($err) . '</p></div>';
+            }
+        }
+    
+        // ✅ This button submits through MLP's main form
         echo '<p><input type="submit" name="export_site_relations" class="button" value="Download Site Relations JSON"></p>';
-        echo '<p><label for="relations_json">Import Site Relations JSON:</label> <input type="file" name="relations_json" accept=".json"> <input type="submit" name="import_site_relations" class="button button-primary" value="Import Relations"></p>';
-        echo '</form>';
+    
+        echo '<h3>Import Site Relations</h3>';
+        echo '<p><label for="import_json">Paste JSON content:</label></p>';
+        echo '<textarea name="import_json" rows="10" cols="80" placeholder="Paste your exported JSON here..."></textarea>';
+        echo '<input type="hidden" name="import_site_relations_json" value="1">';
+    
+        echo '</div>';
     }
+    
 
     public static function handle_site_relations() {
         if (!current_user_can('manage_options')) return;
-
-        if (isset($_POST['export_site_relations']) && check_admin_referer('site_relations_action', 'site_relations_nonce')) {
+    
+        // ✅ No nonce needed — MLP already verifies the form
+    
+        // ✅ Handle Export
+        if (isset($_POST['export_site_relations'])) {
             $data = self::export_site_relations();
             header('Content-Type: application/json');
             header('Content-Disposition: attachment; filename="site-relations-export.json"');
             echo json_encode($data, JSON_PRETTY_PRINT);
             exit;
         }
-
-        if (isset($_POST['import_site_relations']) && check_admin_referer('site_relations_action', 'site_relations_nonce')) {
-            if (!empty($_FILES['relations_json']['tmp_name'])) {
-                $json = file_get_contents($_FILES['relations_json']['tmp_name']);
-                $data = json_decode($json, true);
+    
+        // ✅ Handle Import
+        if (isset($_POST['import_site_relations_json']) && !empty($_POST['import_json'])) {
+            $json = stripslashes_deep($_POST['import_json']);
+            $data = json_decode($json, true);
+    
+            if ($data === null) {
+                set_transient('mlp_import_results', [
+                    'success' => [],
+                    'errors' => ['Invalid JSON format.']
+                ], 30);
+            } else {
                 $results = self::import_site_relations($data);
-                add_action('admin_notices', function () use ($results) {
-                    foreach ($results['success'] as $msg) {
-                        echo '<div class="notice notice-success"><p>' . esc_html($msg) . '</p></div>';
-                    }
-                    foreach ($results['errors'] as $err) {
-                        echo '<div class="notice notice-error"><p>' . esc_html($err) . '</p></div>';
-                    }
-                });
+                set_transient('mlp_import_results', $results, 30);
             }
         }
     }
+    
+    
 
     public static function export_site_relations() {
-        $siteRelations = resolve(Inpsyde\MultilingualPress\API\SiteRelations::class);
+        $siteRelations = \Inpsyde\MultilingualPress\resolve(\Inpsyde\MultilingualPress\Framework\Api\SiteRelations::class);
         $allRelations = $siteRelations->allRelations();
         $export = [
             'version' => '1.0',
@@ -209,7 +229,7 @@ class Language_Exporter {
     }
 
     public static function import_site_relations(array $data) {
-        $siteRelations = resolve(Inpsyde\MultilingualPress\API\SiteRelations::class);
+        $siteRelations = \Inpsyde\MultilingualPress\resolve(\Inpsyde\MultilingualPress\Framework\Api\SiteRelations::class);
         $results = ['success' => [], 'errors' => []];
         if (!isset($data['relations'])) {
             $results['errors'][] = 'Invalid format: missing "relations" key';
@@ -237,5 +257,35 @@ class Language_Exporter {
             }
         }
         return $results;
+    }
+
+    public static function add_mlp_settings_tabs(array $tabs): array {
+        $tabs['language-content-export'] = new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTab(
+            new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTabData(
+                'language-content-export',
+                __('Language Content Export', 'language-exporter'),
+                'language-content-export'
+            ),
+            new class implements \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageView {
+                public function render(): void {
+                    Language_Exporter::render_content_export_tab();
+                }
+            }
+        );
+
+        $tabs['site-relations-export'] = new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTab(
+            new \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageTabData(
+                'site-relations-export',
+                __('Site Relations', 'language-exporter'),
+                'site-relations-export'
+            ),
+            new class implements \Inpsyde\MultilingualPress\Framework\Admin\SettingsPageView {
+                public function render(): void {
+                    Language_Exporter::render_site_relations_tab();
+                }
+            }
+        );
+
+        return $tabs;
     }
 }
